@@ -1,56 +1,26 @@
 // SPDX-License-Identifier: MIT
 
-use std::sync::{Arc, Mutex};
-
 use cosmic::{
     app::Task,
-    iced::{Alignment, Length},
+    iced::{futures::SinkExt, stream, Alignment, Length, Subscription},
     iced_widget::row,
     widget::{autosize::autosize, vertical_space, Id},
-    Action,
 };
-use zbus::Connection;
-use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
+use std::{sync::Arc, time::Duration};
+use x11rb::protocol::{xkb::ConnectionExt, xproto::ModMask};
 
 fn main() -> cosmic::iced::Result {
     cosmic::applet::run::<CapsLockIndicator>(())
 }
 
-async fn polkit_authorize() -> Result<evdev::Device, String> {
-    let connection = Connection::session().await.map_err(|e| e.to_string())?;
-    let proxy = AuthorityProxy::new(&connection)
-        .await
-        .map_err(|e| e.to_string())?;
-    let subject =
-        Subject::new_for_owner(std::process::id(), None, None).map_err(|e| e.to_string())?;
-
-    let result = proxy
-        .check_authorization(
-            &subject,
-            "dev.tking.CapsLockCheck",
-            &std::collections::HashMap::new(),
-            CheckAuthorizationFlags::AllowUserInteraction.into(),
-            "",
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if !result.is_authorized {
-        return Err(format!("{:?}", result.details));
-    }
-
-    let evdev = evdev::Device::open("/dev/input/event11").map_err(|e| e.to_string())?;
-    Ok(evdev)
-}
-
 pub struct CapsLockIndicator {
     core: cosmic::Core,
-    evdev: Result<evdev::Device, String>,
+    caps_active: Result<bool, String>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    PolkitResult(Arc<Mutex<Option<Result<evdev::Device, String>>>>),
+    Update(Result<bool, String>),
 }
 
 impl cosmic::Application for CapsLockIndicator {
@@ -73,24 +43,21 @@ impl cosmic::Application for CapsLockIndicator {
     ) -> (CapsLockIndicator, cosmic::Task<cosmic::Action<Message>>) {
         let applet = CapsLockIndicator {
             core,
-            evdev: Err("Not yet authorized".to_string()),
+            caps_active: Ok(false),
         };
 
-        (
-            applet,
-            Task::future(async move {
-                Action::App(Message::PolkitResult(Arc::new(Mutex::new(Some(
-                    polkit_authorize().await,
-                )))))
-            }),
-        )
+        (applet, Task::none())
     }
 
     fn view(&self) -> cosmic::Element<Message> {
-        let text = self.core.applet.text(match &self.evdev {
-            Ok(_) => "Scanning...",
-            Err(e) => e.as_str(),
-        });
+        let text = self.core.applet.text(
+            match &self.caps_active {
+                Ok(true) => "CAPS",
+                Ok(false) => "",
+                Err(e) => e.as_str(),
+            }
+            .to_string(),
+        );
 
         let content = row!(
             text,
@@ -109,13 +76,76 @@ impl cosmic::Application for CapsLockIndicator {
 
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
-            Message::PolkitResult(device) => self.evdev = device.lock().unwrap().take().unwrap(),
-        };
-
+            Message::Update(caps_active) => {
+                self.caps_active = caps_active;
+            }
+        }
         Task::none()
     }
 
     fn style(&self) -> Option<cosmic::iced_runtime::Appearance> {
         Some(cosmic::applet::style())
+    }
+
+    fn subscription(&self) -> Subscription<Self::Message> {
+        Subscription::run(|| {
+            stream::channel(10, |mut output| async move {
+                let (x_connection, _) = match x11rb::connect(None) {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        let _ = output.send(Message::Update(Err(e.to_string())));
+                        return;
+                    }
+                };
+
+                let xkb_extension_cookie = match x_connection.xkb_use_extension(1, 0) {
+                    Ok(cookie) => cookie,
+                    Err(e) => {
+                        let _ = output.send(Message::Update(Err(e.to_string())));
+                        return;
+                    }
+                };
+                let _xkb_extension_accepted = match xkb_extension_cookie.reply() {
+                    Ok(ext) => ext,
+                    Err(e) => {
+                        let _ = output.send(Message::Update(Err(e.to_string())));
+                        return;
+                    }
+                };
+
+                let x_connection = Arc::new(x_connection);
+
+                loop {
+                    let x_connection = x_connection.clone();
+                    let caps_active = tokio::task::spawn_blocking(move || {
+                        let state_cookie = match x_connection.xkb_get_state(0x100) {
+                            Ok(cookie) => cookie,
+                            Err(e) => {
+                                return Err(e.to_string());
+                            }
+                        };
+                        let state = match state_cookie.reply() {
+                            Ok(state) => state,
+                            Err(e) => {
+                                return Err(e.to_string());
+                            }
+                        };
+                        let caps_active = state.locked_mods.contains(ModMask::LOCK);
+                        // println!("updated caps to {caps_active}");
+                        Ok(caps_active)
+                    })
+                    .await
+                    .map_err(|e| e.to_string());
+                    let _ = output
+                        .send(Message::Update(match caps_active {
+                            Ok(Ok(c)) => Ok(c),
+                            Ok(Err(e)) => Err(e),
+                            Err(e) => Err(e),
+                        }))
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+        })
     }
 }

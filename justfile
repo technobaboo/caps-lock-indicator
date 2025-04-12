@@ -17,9 +17,6 @@ appdata := appid + '.metainfo.xml'
 appdata-src := 'resources' / appdata
 appdata-dst := clean(rootdir / prefix) / 'share' / 'appdata' / appdata
 
-policy-src := 'resources' / 'app.policy'
-policy-dst := clean(rootdir / prefix) / 'share' / 'polkit-1' / 'actions' / appid + '.policy'
-
 icons-src := 'resources' / 'icons' / 'hicolor'
 icons-dst := clean(rootdir / prefix) / 'share' / 'icons' / 'hicolor'
 
@@ -66,12 +63,11 @@ install:
     install -Dm0755 {{bin-src}} {{bin-dst}}
     install -Dm0644 resources/app.desktop {{desktop-dst}}
     install -Dm0644 resources/app.metainfo.xml {{appdata-dst}}
-    install -Dm0644 resources/app.policy {{policy-dst}}
     install -Dm0644 {{icon-svg-src}} {{icon-svg-dst}}
 
 # Uninstalls installed files
 uninstall:
-    rm {{bin-dst}} {{desktop-dst}} {{icon-svg-dst}} {{policy-dst}}
+    rm {{bin-dst}} {{desktop-dst}} {{icon-svg-dst}}
 
 # Vendor dependencies locally
 vendor:

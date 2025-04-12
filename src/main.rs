@@ -2,12 +2,20 @@
 
 use cosmic::{
     app::Task,
-    iced::{futures::SinkExt, stream, Alignment, Length, Subscription},
+    iced::{
+        futures::{SinkExt, StreamExt},
+        stream, Alignment, Length, Subscription,
+    },
     iced_widget::row,
     widget::{autosize::autosize, vertical_space, Id},
 };
-use std::{sync::Arc, time::Duration};
-use x11rb::protocol::{xkb::ConnectionExt, xproto::ModMask};
+use inotify::{EventMask, WatchMask};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    time::Duration,
+};
+use tokio::{sync::watch, task::JoinSet};
 
 fn main() -> cosmic::iced::Result {
     cosmic::applet::run::<CapsLockIndicator>(())
@@ -88,64 +96,117 @@ impl cosmic::Application for CapsLockIndicator {
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        Subscription::run(|| {
-            stream::channel(10, |mut output| async move {
-                let (x_connection, _) = match x11rb::connect(None) {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        let _ = output.send(Message::Update(Err(e.to_string())));
-                        return;
-                    }
-                };
-
-                let xkb_extension_cookie = match x_connection.xkb_use_extension(1, 0) {
-                    Ok(cookie) => cookie,
-                    Err(e) => {
-                        let _ = output.send(Message::Update(Err(e.to_string())));
-                        return;
-                    }
-                };
-                let _xkb_extension_accepted = match xkb_extension_cookie.reply() {
-                    Ok(ext) => ext,
-                    Err(e) => {
-                        let _ = output.send(Message::Update(Err(e.to_string())));
-                        return;
-                    }
-                };
-
-                let x_connection = Arc::new(x_connection);
-
-                loop {
-                    let x_connection = x_connection.clone();
-                    let caps_active = tokio::task::spawn_blocking(move || {
-                        let state_cookie = match x_connection.xkb_get_state(0x100) {
-                            Ok(cookie) => cookie,
-                            Err(e) => {
-                                return Err(e.to_string());
-                            }
-                        };
-                        let state = match state_cookie.reply() {
-                            Ok(state) => state,
-                            Err(e) => {
-                                return Err(e.to_string());
-                            }
-                        };
-                        let caps_active = state.locked_mods.contains(ModMask::LOCK);
-                        // println!("updated caps to {caps_active}");
-                        Ok(caps_active)
-                    })
-                    .await
-                    .map_err(|e| e.to_string());
-                    let _ = output
-                        .send(Message::Update(match caps_active {
-                            Ok(Ok(c)) => Ok(c),
-                            Ok(Err(e)) => Err(e),
-                            Err(e) => Err(e),
-                        }))
-                        .await;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            })
-        })
+        Subscription::run(|| stream::channel(100, poll_method))
     }
 }
+
+async fn poll_method(mut output: cosmic::iced::futures::channel::mpsc::Sender<Message>) {
+    let (folders_tx, folders) = watch::channel(HashSet::<PathBuf>::default());
+
+    let folders_watch_loop = tokio::task::spawn(async move {
+        loop {
+            let Ok(mut read_dir) = tokio::fs::read_dir("/sys/class/leds").await else {
+                continue;
+            };
+
+            let mut folders = HashSet::<PathBuf>::default();
+            while let Ok(Some(dir)) = read_dir.next_entry().await {
+                if dir.file_name().to_str().unwrap().ends_with("::capslock") {
+                    folders.insert(dir.path().join("brightness"));
+                }
+            }
+
+            let _ = folders_tx.send(folders);
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+    });
+
+    loop {
+        let mut join_set = JoinSet::new();
+
+        for folder in folders.borrow().iter().cloned() {
+            join_set.spawn(tokio::fs::read_to_string(folder));
+        }
+
+        let mut caps_brightness = 0_usize;
+        while let Some(folder_read) = join_set.join_next().await {
+            dbg!(&folder_read);
+            let Ok(Ok(brightness)) = folder_read else {
+                continue;
+            };
+            if brightness.starts_with('1') {
+                caps_brightness += 1;
+                break;
+            }
+        }
+
+        let _ = output.send(Message::Update(Ok(caps_brightness > 0))).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+// async fn inotify_method(mut output: cosmic::iced::futures::channel::mpsc::Sender<Message>) {
+//     let inotify_getter = async || {
+//         let inotify = inotify::Inotify::init().map_err(|e| e.to_string())?;
+//         inotify
+//             .watches()
+//             .add(
+//                 // "/sys/class/leds/input",
+//                 Path::new("/sys/class/leds/input11::capslock")
+//                     .canonicalize()
+//                     .unwrap(),
+//                 WatchMask::MODIFY | WatchMask::CREATE | WatchMask::DELETE,
+//             )
+//             .map_err(|e| e.to_string())?;
+
+//         let event_stream = inotify
+//             .into_event_stream([0_u8; 4096])
+//             .map_err(|e| e.to_string())?;
+
+//         Ok::<_, String>(event_stream)
+//     };
+//     let mut event_stream = match inotify_getter().await {
+//         Ok(r) => r,
+//         Err(e) => {
+//             let _ = output.send(Message::Update(Err(e.to_string()))).await;
+//             eprintln!("Failed to get event stream: {e}");
+//             return;
+//         }
+//     };
+
+//     let mut led_states: HashMap<PathBuf, bool> = Default::default();
+
+//     loop {
+//         while let Some(event) = event_stream.next().await {
+//             dbg!(&event);
+//             let Ok(event) = event else {
+//                 eprintln!("Failed to get event");
+//                 continue;
+//             };
+//             let Some(name) = event.name.as_ref().and_then(|s| s.to_str()) else {
+//                 eprintln!("Couldn't get event name");
+//                 continue;
+//             };
+//             if !name.ends_with("::capslock/brightness") {
+//                 eprintln!("Name not caps lock brightness, it was: {name}");
+//                 continue;
+//             }
+
+//             if event.mask.contains(EventMask::CREATE) || event.mask.contains(EventMask::MODIFY) {
+//                 let Ok(led_active) = tokio::fs::read_to_string(name).await else {
+//                     eprintln!("Couldn't read file: {name}");
+//                     continue;
+//                 };
+//                 let entry = led_states
+//                     .entry(PathBuf::from(name.to_string()))
+//                     .or_default();
+//                 *entry = led_active == "1";
+//             } else if event.mask.contains(EventMask::DELETE) {
+//                 led_states.remove(Path::new(name));
+//             }
+
+//             let any_led_active = led_states.values().any(|v| *v);
+
+//             let _ = output.send(Message::Update(Ok(any_led_active))).await;
+//         }
+//     }
+// }

@@ -1,0 +1,11 @@
+<policyconfig>
+  <action id="dev.tking.caps-lock-indicator.read-keyboard-events">
+    <description>Read key events from evdev</description>
+    <message>Authentication required</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

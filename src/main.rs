@@ -130,7 +130,7 @@ async fn poll_method(mut output: cosmic::iced::futures::channel::mpsc::Sender<Me
 
         let mut caps_brightness = 0_usize;
         while let Some(folder_read) = join_set.join_next().await {
-            dbg!(&folder_read);
+            // dbg!(&folder_read);
             let Ok(Ok(brightness)) = folder_read else {
                 continue;
             };
